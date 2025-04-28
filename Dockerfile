@@ -2,14 +2,16 @@ FROM python:3.10
 
 WORKDIR /app
 
+ENV PYTHONPATH="/app:${PYTHONPATH}"
+
 RUN pip install poetry==1.8.2
 
-COPY pyproject.toml poetry.lock ./
+COPY pyproject.toml poetry.lock ./ 
 
-RUN poetry install --only main --no-interaction --no-root
+RUN poetry install --no-interaction
 
 COPY . .
 
-RUN poetry install --only main --no-interaction
+RUN poetry install --no-interaction
 
 CMD ["poetry", "run", "python", "main.py"]

@@ -1,7 +1,6 @@
-from sqlalchemy import Column, Integer, String, Text, ForeignKey
+from sqlalchemy import Column, Integer, String, Text, ForeignKey, DateTime
 from sqlalchemy.orm import relationship
 from app.db.database import Base
-
 
 class UserProfile(Base):
     __tablename__ = "user_profiles"
@@ -10,10 +9,14 @@ class UserProfile(Base):
     telegram_id = Column(String, unique=True, index=True, nullable=False)
     name = Column(String, nullable=True)
     age = Column(Integer, nullable=True)
-    gender = Column(String, nullable=True)
+    gender = Column(String, nullable=False)
     interests = Column(Text, nullable=True)
     city = Column(String, nullable=True)
     photo_url = Column(String, nullable=True)
+
+    age_min = Column(Integer, default=18)  # Пример: 18 лет
+    age_max = Column(Integer, default=99)
+    city_filter = Column(String)
 
     liked_users = relationship(
         "UserLike",
@@ -36,6 +39,8 @@ class UserProfile(Base):
         )
 
 
+
+
 class UserLike(Base):
     __tablename__ = "user_likes"
 
@@ -48,3 +53,7 @@ class UserLike(Base):
 
     def __repr__(self):
         return f"<UserLike(liker_id={self.liker_id}, liked_id={self.liked_id})>"
+    
+
+
+

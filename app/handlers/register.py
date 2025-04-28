@@ -4,13 +4,26 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from random import shuffle
-import re
 
-from app.states import RegisterState
+from app.states import RegisterState, FilterState
 from app.db.models import UserProfile, UserLike
 from app.db.database import get_session
+from app.rabbit.producer import publish_profile
+from app.rabbit.consumer import get_next_profile
+from core.redis import get_redis
+from app.tasks import send_like_notification
+from fastapi import FastAPI
+
+
 
 router = Router()
+
+app = FastAPI()
+
+@app.get("/health")
+def read_health():
+    return {"status": "ok"}
+
 
 def main_keyboard() -> types.ReplyKeyboardMarkup:
     builder = ReplyKeyboardBuilder()
@@ -37,6 +50,22 @@ def format_profile(profile: UserProfile) -> str:
         f"🎯 Интересы: {profile.interests}\n"
         f"🏷️ Тег: @id{profile.telegram_id}"
     )
+
+def gender_keyboard() -> types.ReplyKeyboardMarkup:
+    builder = ReplyKeyboardBuilder()
+    builder.row(
+        types.KeyboardButton(text="Мужчина"),
+        types.KeyboardButton(text="Женщина")
+    )
+    return builder.as_markup(resize_keyboard=True, one_time_keyboard=True)
+
+
+async def some_function():
+    redis_conn = await get_redis()
+    await redis_conn.set("mykey", "myvalue")
+    value = await redis_conn.get("mykey")
+    print(value) 
+    
 
 @router.message(F.text.in_(["/start"]))
 async def start(message: types.Message):
@@ -115,14 +144,20 @@ async def reg_age(message: types.Message, state: FSMContext):
         return await message.answer("Пожалуйста, введи корректный возраст (число).")
 
     await state.update_data(age=int(message.text))
-    await message.answer("Укажи свой пол (М/Ж/Другое):")
+    await message.answer("Укажи свой пол:", reply_markup=gender_keyboard())
     await state.set_state(RegisterState.gender)
+
 
 @router.message(RegisterState.gender)
 async def reg_gender(message: types.Message, state: FSMContext):
+    if message.text not in ["Мужчина", "Женщина"]:
+        await message.answer("Пожалуйста, выбери пол, используя кнопки ниже:", reply_markup=gender_keyboard())
+        return
+
     await state.update_data(gender=message.text)
-    await message.answer("Расскажи немного о себе (интересы, увлечения):")
+    await message.answer("Расскажи немного о себе (интересы, увлечения):", reply_markup=types.ReplyKeyboardRemove())
     await state.set_state(RegisterState.about)
+
 
 @router.message(RegisterState.about)
 async def reg_about(message: types.Message, state: FSMContext):
@@ -227,30 +262,100 @@ async def save_profile_photo(message: types.Message, state: FSMContext):
 
     await state.clear()
 
+
 @router.message(RegisterState.photo)
 async def wrong_photo(message: types.Message):
     await message.answer("Пожалуйста, отправь фото как изображение, не как файл.")
 
 @router.message(F.text == "👀 Смотреть анкеты")
-async def show_random_profiles(message: types.Message, state: FSMContext):
+async def ask_age_min(message: types.Message, state: FSMContext):
+    await message.answer("🔢 Введи минимальный возраст:")
+    await state.set_state(FilterState.age_min)
+
+@router.message(FilterState.age_min)
+async def ask_age_max(message: types.Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Пожалуйста, введи число для минимального возраста.")
+        return
+    await state.update_data(age_min=int(message.text))
+    await message.answer("🔢 Теперь введи максимальный возраст:")
+    await state.set_state(FilterState.age_max)
+
+@router.message(FilterState.age_max)
+async def ask_gender(message: types.Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Пожалуйста, введи число для максимального возраста.")
+        return
+    await state.update_data(age_max=int(message.text))
+    builder = ReplyKeyboardBuilder()
+    builder.row(
+        types.KeyboardButton(text="Мужчины"),
+        types.KeyboardButton(text="Женщины"),
+        types.KeyboardButton(text="Все")
+    )
+    await message.answer("🚻 Кого ищешь?", reply_markup=builder.as_markup(resize_keyboard=True))
+    await state.set_state(FilterState.gender)
+
+@router.message(FilterState.gender)
+async def show_filtered_profiles(message: types.Message, state: FSMContext):
+    gender = message.text
+    if gender not in ["Мужчины", "Женщины", "Все"]:
+        await message.answer("Пожалуйста, выбери из предложенных вариантов.")
+        return
+
+    await state.update_data(gender=gender)
+    data = await state.get_data()
+
     async with get_session() as session:
         result = await session.execute(
-            select(UserProfile).where(
-                UserProfile.telegram_id != str(message.from_user.id)
-        ))
+            select(UserProfile).where(UserProfile.telegram_id == str(message.from_user.id))
+        )
+        current_user = result.scalar_one_or_none()
+
+        if not current_user:
+            await message.answer("❌ Ты ещё не зарегистрирован.")
+            await state.clear()
+            return
+
+        query = select(UserProfile).where(
+            UserProfile.telegram_id != str(message.from_user.id),
+            UserProfile.city == current_user.city,
+            UserProfile.age >= data['age_min'],
+            UserProfile.age <= data['age_max']
+        )
+
+        if data['gender'] == "Мужчины":
+            query = query.where(UserProfile.gender == "Мужчина")
+        elif data['gender'] == "Женщины":
+            query = query.where(UserProfile.gender == "Женщина")
+
+        result = await session.execute(query)
         profiles = result.scalars().all()
 
         if not profiles:
-            await message.answer("😔 Пока нет других анкет для просмотра")
+            await message.answer("😔 Нет анкет, подходящих под твои критерии.", reply_markup=main_keyboard())
+            await state.clear()
             return
 
         shuffle(profiles)
-        await state.update_data(
-            profiles=[p.telegram_id for p in profiles],
-            current_index=0
-        )
 
+
+        for profile in profiles:
+            await publish_profile({
+                "telegram_id": profile.telegram_id,
+                "name": profile.name,
+                "age": profile.age,
+                "gender": profile.gender,
+                "city": profile.city,
+                "interests": profile.interests,
+                "photo_url": profile.photo_url
+            })
+
+        await message.answer("Секундочку, подбираю анкеты 🔎", reply_markup=types.ReplyKeyboardRemove())
         await show_profile_by_index(message, state)
+
+
+
 
 def profiles_keyboard(current_index: int, total: int) -> types.InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -260,59 +365,59 @@ def profiles_keyboard(current_index: int, total: int) -> types.InlineKeyboardMar
         callback_data=f"like_{current_index}"
     )
 
-    if current_index + 1 < total:
-        builder.button(
-            text="➡️ Далее",
-            callback_data=f"next_{current_index + 1}"
-        )
+    builder.button(
+        text="➡️ Далее",
+        callback_data=f"next_{current_index + 1}"
+    )
 
     return builder.as_markup()
 
 
+
 async def show_profile_by_index(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    profiles = data.get('profiles', [])
-    current_index = data.get('current_index', 0)
-    
-    if current_index >= len(profiles):
-        await message.answer("🏁 Вы просмотрели все анкеты!")
+    profile_data = await get_next_profile()
+
+    if not profile_data:
+        await message.answer("🏁 Вы просмотрели все анкеты!", reply_markup=main_keyboard())
         await state.clear()
         return
 
-    async with get_session() as session:
-        result = await session.execute(
-            select(UserProfile).where(
-                UserProfile.telegram_id == profiles[current_index]
-            )
-        )
-        profile = result.scalars().first()
+    await message.answer_photo(
+        photo=profile_data["photo_url"],
+        caption=f"📝 Анкета:\n\n"
+                f"👤 Имя: {profile_data['name']}\n"
+                f"🔢 Возраст: {profile_data['age']}\n"
+                f"🚻 Пол: {profile_data['gender']}\n"
+                f"🏙️ Город: {profile_data['city']}\n"
+                f"🎯 Интересы: {profile_data['interests']}\n"
+                f"🏷️ Тег: @id{profile_data['telegram_id']}",
+        reply_markup=profiles_keyboard(0, 0) 
+    )
 
-    if profile:
-        await message.answer_photo(
-            photo=profile.photo_url,
-            caption=f"{format_profile(profile)}\n\n"
-                    f"Анкета {current_index + 1} из {len(profiles)}",
-            reply_markup=profiles_keyboard(current_index, len(profiles))
-        )
-    else:
-        await state.update_data(current_index=current_index + 1)
-        await show_profile_by_index(message, state)
+    await state.update_data(current_profile=profile_data)
+
 
 @router.callback_query(F.data.startswith("next_"))
 async def next_profile(callback: types.CallbackQuery, state: FSMContext):
-    new_index = int(callback.data.split("_")[1])
-    await state.update_data(current_index=new_index)
     await show_profile_by_index(callback.message, state)
     await callback.answer()
 
 
-
 @router.callback_query(F.data.startswith("like_"))
 async def like_profile(callback: types.CallbackQuery, state: FSMContext):
-    profile_index = int(callback.data.split("_")[1])
-    user_telegram_id = str(callback.from_user.id)
+    from app.bot import bot 
 
     async with get_session() as session:
+        data = await state.get_data()
+        current_profile = data.get('current_profile')
+
+        if not current_profile:
+            await callback.answer("⚠️ Нет профиля для лайка.")
+            return
+
+        user_telegram_id = str(callback.from_user.id)
+        user_username = callback.from_user.username
+
         result = await session.execute(
             select(UserProfile).where(UserProfile.telegram_id == user_telegram_id)
         )
@@ -322,16 +427,8 @@ async def like_profile(callback: types.CallbackQuery, state: FSMContext):
             await callback.answer("⚠️ Ваша анкета не найдена. Зарегистрируйтесь сначала.")
             return
 
-        data = await state.get_data()
-        profiles = data.get("profiles", [])
-        if profile_index >= len(profiles):
-            await callback.answer("⚠️ Анкета не найдена.")
-            return
-
-        liked_telegram_id = profiles[profile_index]
-
         result = await session.execute(
-            select(UserProfile).where(UserProfile.telegram_id == liked_telegram_id)
+            select(UserProfile).where(UserProfile.telegram_id == current_profile['telegram_id'])
         )
         liked_user = result.scalar_one_or_none()
 
@@ -352,51 +449,45 @@ async def like_profile(callback: types.CallbackQuery, state: FSMContext):
         like = UserLike(liker_id=current_user.id, liked_id=liked_user.id)
         session.add(like)
         await session.commit()
-
         await callback.answer("❤️ Лайк сохранён!")
 
-        new_index = profile_index + 1
-        if new_index >= len(profiles):
-            await callback.message.answer("🏁 Вы просмотрели все анкеты!")
-            await state.clear()
-        else:
-            await state.update_data(current_index=new_index)
-            await show_profile_by_index(callback.message, state)
-
-        reverse_like = await session.execute(
+        reciprocal_like = await session.execute(
             select(UserLike).where(
                 UserLike.liker_id == liked_user.id,
                 UserLike.liked_id == current_user.id
             )
         )
-        if reverse_like.scalar():
-            print(f'liked_user.telegram_id {liked_user.telegram_id}')
+        if reciprocal_like.scalar():
             match_msg_to_liker = (
-                f"🎉 У вас взаимный лайк с [{liked_user.name}](tg://user?id={liked_user.telegram_id})!\n"
+                f"🎉 У вас взаимный лайк с [{liked_user.name or 'пользователь'}](tg://user?id={liked_user.telegram_id})!\n"
                 "Можете написать пользователю прямо сейчас 😉"
             )
-            print(f'liked_user.telegram_id {current_user.telegram_id}')
             match_msg_to_liked = (
-                f"🎉 У вас взаимный лайк с [{current_user.name}](tg://user?id={current_user.telegram_id})!\n"
+                f"🎉 У вас взаимный лайк с [{current_user.name or 'пользователь'}](tg://user?id={current_user.telegram_id})!\n"
                 "Можете начать общение!"
             )
 
             try:
-                await callback.bot.send_message(
+                await bot.send_message(
                     liked_user.telegram_id,
                     match_msg_to_liked,
                     parse_mode="Markdown"
                 )
-            except Exception as e:
-                print(f"Ошибка при отправке мэтча liked_user: {e}")
-
-            try:
-                await callback.message.answer(
+                await bot.send_message(
+                    current_user.telegram_id,
                     match_msg_to_liker,
                     parse_mode="Markdown"
                 )
             except Exception as e:
-                print(f"Ошибка при отправке мэтча current_user: {e}")
+                print(f"Ошибка при отправке сообщений о мэтче: {e}")
+
+        else:
+            send_like_notification.delay(
+                user_id=liked_user.telegram_id,
+                liker_name=user_username or str(current_user.telegram_id)
+            )
+
+        await show_profile_by_index(callback.message, state)
 
 
 
@@ -425,6 +516,5 @@ async def delete_profile(message: types.Message, state: FSMContext):
 
     await state.clear()
     await message.answer("🗑 Твоя анкета была удалена.", reply_markup=main_keyboard())
-
 
 

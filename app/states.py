@@ -7,3 +7,10 @@ class RegisterState(StatesGroup):
     about = State()
     city = State()
     photo = State()
+    edit_field = State()
+
+
+class FilterState(StatesGroup):
+    age_min = State()
+    age_max = State()
+    gender = State()

@@ -28,29 +28,53 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBIT_USER}
       RABBITMQ_DEFAULT_PASS: ${RABBIT_PASSWORD}
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis:
     image: redis:7-alpine
     container_name: redis
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  bot:
+  tg_fastapi_bot:
     build: .
     container_name: tg_fastapi_bot
     depends_on:
       postgres:
         condition: service_healthy
       rabbitmq:
-        condition: service_started
+        condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
     env_file:
       - .env
     volumes:
       - .:/app
     ports:
-      - "${API_PORT}:8000"
+      - "${API_PORT:-8000}:8000"
+    restart: on-failure
+    command: poetry run python main.py  
+
+  celery:
+    build: .
+    container_name: celery
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+    volumes:
+      - .:/app
+    command: poetry run celery -A app.tasks.celery_app worker --loglevel=info
+
 
 volumes:
   pg_data:
